@@ -8,7 +8,6 @@ PAPER TRADING ONLY — no real orders, no authentication.
 
 import csv
 import logging
-import math
 import os
 import sys
 import threading
@@ -62,9 +61,9 @@ CFG = {
 # ──────────────────────────────────────────────────────────────────────────────
 
 COINBASE_BTC_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
-GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
-CLOB_BOOK_URL    = "https://clob.polymarket.com/book"
-HTTP_TIMEOUT     = 8
+GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
+CLOB_BOOK_URL = "https://clob.polymarket.com/book"
+HTTP_TIMEOUT = 8
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  LOGGING
@@ -190,13 +189,10 @@ def compute_momentum() -> Optional[float]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 _FIVEMIN_RE = _re.compile(
-    r'\b5[\s\-]?min(?:ute)?s?\b|five[\s\-]?minutes?\b|\b5m\b',
+    r"\b5[\s\-]?min(?:ute)?s?\b|five[\s\-]?minutes?\b|\b5m\b",
     _re.IGNORECASE
 )
-_BTC_RE = _re.compile(r'\b(btc|bitcoin)\b', _re.IGNORECASE)
-
-def _is_btc_5m(text: str) -> bool:
-    return bool(_BTC_RE.search(text)) and bool(_FIVEMIN_RE.search(text))
+_BTC_RE = _re.compile(r"\b(btc|bitcoin)\b", _re.IGNORECASE)
 
 def _has_updown(text: str) -> bool:
     t = text.lower()
@@ -259,109 +255,124 @@ def _extract_tokens(market: dict) -> Optional[tuple]:
     return None
 
 def discover_market() -> Optional[dict]:
-    log.info("Market discovery — querying Gamma events API")
+    log.info("Market discovery — querying Gamma markets API")
 
-    params = {
-        "active": "true",
-        "closed": "false",
-        "limit": 200,
-    }
-    data = _get(GAMMA_EVENTS_URL, params=params)
-    if data is None:
-        log.warning("Gamma events API unreachable")
-        return None
+    all_markets = []
+    offset = 0
+    limit = 200
+    now = time.time()
 
-    events = data if isinstance(data, list) else (
-        data.get("data") or data.get("events") or data.get("results") or []
-    )
+    while offset < 1000:
+        params = {
+            "active": "true",
+            "closed": "false",
+            "limit": limit,
+            "offset": offset,
+        }
+        data = _get(GAMMA_MARKETS_URL, params=params)
+        if data is None:
+            log.warning("Gamma markets API unreachable")
+            return None
 
-    log.info(f"Gamma returned {len(events)} events")
+        markets = data if isinstance(data, list) else (
+            data.get("data") or data.get("markets") or data.get("results") or []
+        )
+
+        if not markets:
+            break
+
+        all_markets.extend(markets)
+
+        if len(markets) < limit:
+            break
+
+        offset += limit
+
+    log.info(f"Gamma returned {len(all_markets)} markets")
 
     candidates = []
     near_misses = []
-    now = time.time()
 
-    for event in events:
-        markets_in_event = event.get("markets") or [event]
+    for mkt in all_markets:
+        question = str(mkt.get("question") or mkt.get("title") or "")
+        desc = str(mkt.get("description") or "")
+        slug = str(mkt.get("slug") or "")
+        group_title = str(mkt.get("groupItemTitle") or "")
+        combined = f"{question} {desc} {slug} {group_title}".lower()
 
-        for mkt in markets_in_event:
-            question = str(mkt.get("question") or mkt.get("title") or "")
-            title = str(event.get("title") or event.get("question") or "")
-            desc = str(mkt.get("description") or event.get("description") or "")
-            slug = str(mkt.get("slug") or event.get("slug") or "")
-            group_title = str(mkt.get("groupItemTitle") or "")
-            combined = f"{question} {title} {desc} {slug} {group_title}".lower()
+        slug_match = "btc-updown-5m" in slug
+        is_btc = bool(_BTC_RE.search(combined))
+        is_5m = bool(_FIVEMIN_RE.search(combined)) or slug_match
+        is_updown = _has_updown(combined) or slug_match
 
-            slug_match = "btc-updown-5m" in slug
+        label_for_log = question or slug or "unknown"
 
-            is_btc = any(k in combined for k in ("btc", "bitcoin"))
-            is_5m = bool(_FIVEMIN_RE.search(combined)) or slug_match
-            is_updown = _has_updown(combined) or slug_match
+        if not is_btc:
+            continue
+        if not is_5m:
+            if len(near_misses) < 10:
+                near_misses.append(f"SKIP no 5m: {label_for_log}")
+            continue
+        if not is_updown:
+            if len(near_misses) < 10:
+                near_misses.append(f"SKIP no up/down: {label_for_log}")
+            continue
+        if mkt.get("closed") or mkt.get("archived") or mkt.get("resolved"):
+            if len(near_misses) < 10:
+                near_misses.append(f"SKIP closed/resolved: {label_for_log}")
+            continue
+        if mkt.get("enableOrderBook") is False:
+            if len(near_misses) < 10:
+                near_misses.append(f"SKIP no orderbook: {label_for_log}")
+            continue
 
-            label_for_log = question or title or slug or "unknown"
+        expiry = _parse_expiry(mkt)
+        if expiry is None or expiry <= now:
+            if len(near_misses) < 10:
+                near_misses.append(f"SKIP bad expiry: {label_for_log}")
+            continue
 
-            if not is_btc:
-                continue
-            if not is_5m:
-                if len(near_misses) < 10:
-                    near_misses.append(f"SKIP no 5m: {label_for_log}")
-                continue
-            if not is_updown:
-                if len(near_misses) < 10:
-                    near_misses.append(f"SKIP no up/down: {label_for_log}")
-                continue
-            if mkt.get("closed") or mkt.get("archived") or mkt.get("resolved"):
-                if len(near_misses) < 10:
-                    near_misses.append(f"SKIP closed/resolved: {label_for_log}")
-                continue
+        token_info = _extract_tokens(mkt)
+        if token_info is None:
+            if len(near_misses) < 10:
+                near_misses.append(f"SKIP no tokens: {label_for_log}")
+            continue
 
-            expiry = _parse_expiry(mkt) or _parse_expiry(event)
-            if expiry is None or expiry <= now:
-                if len(near_misses) < 10:
-                    near_misses.append(f"SKIP bad expiry: {label_for_log}")
-                continue
+        up_label, dn_label, up_tid, dn_tid = token_info
 
-            token_info = _extract_tokens(mkt)
-            if token_info is None:
-                if len(near_misses) < 10:
-                    near_misses.append(f"SKIP no tokens: {label_for_log}")
-                continue
+        fee_rate = 0.0
+        for key in ("feeRate", "makerBaseFee", "takerBaseFee", "fee_rate"):
+            val = mkt.get(key)
+            if val is not None:
+                try:
+                    fee_rate = float(val)
+                    if fee_rate > 0:
+                        break
+                except (TypeError, ValueError):
+                    pass
 
-            up_label, dn_label, up_tid, dn_tid = token_info
-
-            fee_rate = 0.0
-            for key in ("feeRate", "makerBaseFee", "takerBaseFee", "fee_rate"):
-                val = mkt.get(key)
-                if val is not None:
-                    try:
-                        fee_rate = float(val)
-                        if fee_rate > 0:
-                            break
-                    except (TypeError, ValueError):
-                        pass
-
-            candidate = {
-                "market_id":   str(mkt.get("id") or mkt.get("conditionId") or slug or "?"),
-                "question":    label_for_log,
-                "expiry_ts":   expiry,
-                "up_label":    up_label,
-                "dn_label":    dn_label,
-                "token_id_up": up_tid,
-                "token_id_dn": dn_tid,
-                "fee_rate":    fee_rate,
-            }
-            candidates.append(candidate)
-            log.info(
-                f"CANDIDATE id={candidate['market_id']} "
-                f"expiry_in={expiry - now:.0f}s "
-                f"q='{candidate['question'][:80]}'"
-            )
+        candidate = {
+            "market_id":   str(mkt.get("id") or mkt.get("conditionId") or slug or "?"),
+            "question":    label_for_log,
+            "expiry_ts":   expiry,
+            "up_label":    up_label,
+            "dn_label":    dn_label,
+            "token_id_up": up_tid,
+            "token_id_dn": dn_tid,
+            "fee_rate":    fee_rate,
+        }
+        candidates.append(candidate)
+        log.info(
+            f"CANDIDATE id={candidate['market_id']} "
+            f"expiry_in={expiry - now:.0f}s "
+            f"slug='{slug}' q='{candidate['question'][:80]}'"
+        )
 
     for line in near_misses[:10]:
         log.info(line)
 
     if not candidates:
-        log.warning("No BTC 5m Up/Down market found in Gamma events")
+        log.warning("No BTC 5m Up/Down market found in Gamma markets")
         return None
 
     valid = [c for c in candidates if c["expiry_ts"] - now > 25]
