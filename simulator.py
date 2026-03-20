@@ -144,10 +144,10 @@ def _get(url: str, params: dict = None) -> Optional[dict]:
         r.raise_for_status()
         return r.json()
     except requests.exceptions.Timeout:
-        log.warning(f"Timeout: {url}")
+        log.warning(f"Timeout: {url} params={params}")
     except requests.exceptions.HTTPError as e:
         code = getattr(e.response, "status_code", "?")
-        log.warning(f"HTTP {code}: {url}")
+        log.warning(f"HTTP {code}: {url} params={params}")
     except requests.exceptions.RequestException as e:
         log.warning(f"Request error {url}: {e}")
     except Exception as e:
@@ -254,14 +254,107 @@ def _extract_tokens(market: dict) -> Optional[tuple]:
 
     return None
 
+def _normalize_candidate(mkt: dict, source: str = "") -> Optional[dict]:
+    question = str(mkt.get("question") or mkt.get("title") or "")
+    desc = str(mkt.get("description") or "")
+    slug = str(mkt.get("slug") or "")
+    group_title = str(mkt.get("groupItemTitle") or "")
+    combined = f"{question} {desc} {slug} {group_title}".lower()
+
+    slug_match = "btc-updown-5m" in slug
+    is_btc = bool(_BTC_RE.search(combined))
+    is_5m = bool(_FIVEMIN_RE.search(combined)) or slug_match
+    is_updown = _has_updown(combined) or slug_match
+
+    if not is_btc or not is_5m or not is_updown:
+        return None
+    if mkt.get("closed") or mkt.get("archived") or mkt.get("resolved"):
+        return None
+    if mkt.get("enableOrderBook") is False:
+        return None
+
+    expiry = _parse_expiry(mkt)
+    now = time.time()
+    if expiry is None or expiry <= now:
+        return None
+
+    token_info = _extract_tokens(mkt)
+    if token_info is None:
+        return None
+
+    up_label, dn_label, up_tid, dn_tid = token_info
+
+    fee_rate = 0.0
+    for key in ("feeRate", "makerBaseFee", "takerBaseFee", "fee_rate"):
+        val = mkt.get(key)
+        if val is not None:
+            try:
+                fee_rate = float(val)
+                if fee_rate > 0:
+                    break
+            except (TypeError, ValueError):
+                pass
+
+    return {
+        "market_id":   str(mkt.get("id") or mkt.get("conditionId") or slug or "?"),
+        "question":    question or slug or "unknown",
+        "expiry_ts":   expiry,
+        "up_label":    up_label,
+        "dn_label":    dn_label,
+        "token_id_up": up_tid,
+        "token_id_dn": dn_tid,
+        "fee_rate":    fee_rate,
+        "slug":        slug,
+        "source":      source,
+    }
+
+def _slug_candidates():
+    now = int(time.time())
+    current_floor = now - (now % 300)
+    vals = []
+    for delta in (-600, -300, 0, 300, 600, 900):
+        vals.append(f"btc-updown-5m-{current_floor + delta}")
+    return vals
+
 def discover_market() -> Optional[dict]:
-    log.info("Market discovery — querying Gamma markets API")
+    log.info("Market discovery — trying direct slug lookup first")
+
+    direct_candidates = []
+    for slug in _slug_candidates():
+        data = _get(GAMMA_MARKETS_URL, params={"slug": slug})
+        if data is None:
+            continue
+
+        markets = data if isinstance(data, list) else (
+            data.get("data") or data.get("markets") or data.get("results") or [data]
+        )
+
+        if isinstance(markets, dict):
+            markets = [markets]
+
+        for mkt in markets:
+            if not isinstance(mkt, dict):
+                continue
+            cand = _normalize_candidate(mkt, source=f"slug:{slug}")
+            if cand:
+                direct_candidates.append(cand)
+                log.info(
+                    f"DIRECT CANDIDATE id={cand['market_id']} "
+                    f"expiry_in={cand['expiry_ts'] - time.time():.0f}s "
+                    f"slug='{cand['slug']}'"
+                )
+
+    valid_direct = [c for c in direct_candidates if c["expiry_ts"] - time.time() > 25]
+    if valid_direct:
+        best = min(valid_direct, key=lambda c: c["expiry_ts"])
+        log.info(f"Selected market via slug: {best['market_id']} | {best['question'][:70]}")
+        return best
+
+    log.info("Direct slug lookup found nothing — falling back to Gamma markets scan")
 
     all_markets = []
     offset = 0
     limit = 200
-    now = time.time()
-
     while offset < 1000:
         params = {
             "active": "true",
@@ -282,10 +375,8 @@ def discover_market() -> Optional[dict]:
             break
 
         all_markets.extend(markets)
-
         if len(markets) < limit:
             break
-
         offset += limit
 
     log.info(f"Gamma returned {len(all_markets)} markets")
@@ -300,88 +391,38 @@ def discover_market() -> Optional[dict]:
         group_title = str(mkt.get("groupItemTitle") or "")
         combined = f"{question} {desc} {slug} {group_title}".lower()
 
-        slug_match = "btc-updown-5m" in slug
-        is_btc = bool(_BTC_RE.search(combined))
-        is_5m = bool(_FIVEMIN_RE.search(combined)) or slug_match
-        is_updown = _has_updown(combined) or slug_match
-
         label_for_log = question or slug or "unknown"
 
-        if not is_btc:
+        if not bool(_BTC_RE.search(combined)):
             continue
-        if not is_5m:
+        if not (bool(_FIVEMIN_RE.search(combined)) or "btc-updown-5m" in slug):
             if len(near_misses) < 10:
                 near_misses.append(f"SKIP no 5m: {label_for_log}")
             continue
-        if not is_updown:
+        if not (_has_updown(combined) or "btc-updown-5m" in slug):
             if len(near_misses) < 10:
                 near_misses.append(f"SKIP no up/down: {label_for_log}")
             continue
-        if mkt.get("closed") or mkt.get("archived") or mkt.get("resolved"):
-            if len(near_misses) < 10:
-                near_misses.append(f"SKIP closed/resolved: {label_for_log}")
-            continue
-        if mkt.get("enableOrderBook") is False:
-            if len(near_misses) < 10:
-                near_misses.append(f"SKIP no orderbook: {label_for_log}")
-            continue
 
-        expiry = _parse_expiry(mkt)
-        if expiry is None or expiry <= now:
-            if len(near_misses) < 10:
-                near_misses.append(f"SKIP bad expiry: {label_for_log}")
-            continue
-
-        token_info = _extract_tokens(mkt)
-        if token_info is None:
-            if len(near_misses) < 10:
-                near_misses.append(f"SKIP no tokens: {label_for_log}")
-            continue
-
-        up_label, dn_label, up_tid, dn_tid = token_info
-
-        fee_rate = 0.0
-        for key in ("feeRate", "makerBaseFee", "takerBaseFee", "fee_rate"):
-            val = mkt.get(key)
-            if val is not None:
-                try:
-                    fee_rate = float(val)
-                    if fee_rate > 0:
-                        break
-                except (TypeError, ValueError):
-                    pass
-
-        candidate = {
-            "market_id":   str(mkt.get("id") or mkt.get("conditionId") or slug or "?"),
-            "question":    label_for_log,
-            "expiry_ts":   expiry,
-            "up_label":    up_label,
-            "dn_label":    dn_label,
-            "token_id_up": up_tid,
-            "token_id_dn": dn_tid,
-            "fee_rate":    fee_rate,
-        }
-        candidates.append(candidate)
-        log.info(
-            f"CANDIDATE id={candidate['market_id']} "
-            f"expiry_in={expiry - now:.0f}s "
-            f"slug='{slug}' q='{candidate['question'][:80]}'"
-        )
+        cand = _normalize_candidate(mkt, source="scan")
+        if cand:
+            candidates.append(cand)
+            log.info(
+                f"CANDIDATE id={cand['market_id']} "
+                f"expiry_in={cand['expiry_ts'] - time.time():.0f}s "
+                f"slug='{cand['slug']}' q='{cand['question'][:80]}'"
+            )
 
     for line in near_misses[:10]:
         log.info(line)
 
-    if not candidates:
+    valid = [c for c in candidates if c["expiry_ts"] - time.time() > 25]
+    if not valid:
         log.warning("No BTC 5m Up/Down market found in Gamma markets")
         return None
 
-    valid = [c for c in candidates if c["expiry_ts"] - now > 25]
-    if not valid:
-        log.warning("All candidates expire too soon")
-        return None
-
     best = min(valid, key=lambda c: c["expiry_ts"])
-    log.info(f"Selected market: {best['market_id']} | {best['question'][:70]}")
+    log.info(f"Selected market via scan: {best['market_id']} | {best['question'][:70]}")
     return best
 
 # ──────────────────────────────────────────────────────────────────────────────
