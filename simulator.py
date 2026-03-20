@@ -1,9 +1,13 @@
 """
-Polymarket BTC 5-Minute Paper Trading Bot
-=========================================
+Polymarket BTC Daily Up/Down Paper Trading Bot
+==============================================
 Runs as a Flask web service (Render free-tier compatible).
 Background thread handles all market logic.
 PAPER TRADING ONLY — no real orders, no authentication.
+
+Target market family:
+- Daily Bitcoin Up/Down markets like:
+  "Bitcoin Up or Down on March 21, 2026?"
 """
 
 import csv
@@ -39,19 +43,19 @@ def _env_int(key: str, default: int) -> int:
 
 CFG = {
     "port":                int(os.environ.get("PORT", 10000)),
-    "poll_interval":       _env_float("POLL_INTERVAL", 8),
-    "btc_lookback_s":      _env_float("BTC_LOOKBACK_S", 20),
-    "min_move_pct":        _env_float("MIN_MOVE_PCT", 0.04),
+    "poll_interval":       _env_float("POLL_INTERVAL", 15),
+    "btc_lookback_s":      _env_float("BTC_LOOKBACK_S", 1800),   # 30m
+    "min_move_pct":        _env_float("MIN_MOVE_PCT", 0.15),     # 0.15%
     "arb_threshold":       _env_float("ARB_THRESHOLD", 0.97),
-    "max_up_ask":          _env_float("MAX_UP_ASK", 0.45),
-    "min_dn_ask":          _env_float("MIN_DN_ASK", 0.55),
-    "max_spread":          _env_float("MAX_SPREAD", 0.03),
+    "max_up_ask":          _env_float("MAX_UP_ASK", 0.62),
+    "min_dn_ask":          _env_float("MIN_DN_ASK", 0.38),
+    "max_spread":          _env_float("MAX_SPREAD", 0.05),
     "min_size":            _env_float("MIN_SIZE", 50),
     "shares":              _env_int("SHARES", 100),
-    "profit_target":       _env_float("PROFIT_TARGET", 0.05),
+    "profit_target":       _env_float("PROFIT_TARGET", 0.06),
     "fee_rate":            _env_float("FEE_RATE", 0.0),
-    "entry_window_start":  _env_int("ENTRY_WINDOW_START_S", 90),
-    "entry_window_end":    _env_int("ENTRY_WINDOW_END_S", 60),
+    "entry_window_start":  _env_int("ENTRY_WINDOW_START_S", 21600),   # 6h
+    "entry_window_end":    _env_int("ENTRY_WINDOW_END_S", 1800),      # 30m
     "log_file":            os.environ.get("LOG_FILE", "trades.csv"),
     "max_log_lines":       _env_int("MAX_LOG_LINES", 200),
 }
@@ -115,7 +119,7 @@ state = {
     "pending_market":  None,
 
     "btc_price":       None,
-    "btc_history":     deque(maxlen=300),
+    "btc_history":     deque(maxlen=5000),
 
     "up_quote":        None,
     "dn_quote":        None,
@@ -186,14 +190,11 @@ def compute_momentum() -> Optional[float]:
     return (window[-1][1] - window[0][1]) / window[0][1]
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  MARKET DISCOVERY
+#  DAILY BTC UP/DOWN MARKET DISCOVERY
 # ──────────────────────────────────────────────────────────────────────────────
 
-_FIVEMIN_RE = _re.compile(
-    r"\b5[\s\-]?min(?:ute)?s?\b|five[\s\-]?minutes?\b|\b5m\b",
-    _re.IGNORECASE
-)
 _BTC_RE = _re.compile(r"\b(btc|bitcoin)\b", _re.IGNORECASE)
+_DAILY_UPDOWN_RE = _re.compile(r"bitcoin up or down on", _re.IGNORECASE)
 
 def _has_updown(text: str) -> bool:
     t = text.lower()
@@ -255,19 +256,23 @@ def _extract_tokens(market: dict) -> Optional[tuple]:
 
     return None
 
-def _normalize_candidate(mkt: dict, source: str = "") -> Optional[dict]:
+def _normalize_daily_candidate(mkt: dict, source: str = "") -> Optional[dict]:
     question = str(mkt.get("question") or mkt.get("title") or "")
     desc = str(mkt.get("description") or "")
     slug = str(mkt.get("slug") or "")
     group_title = str(mkt.get("groupItemTitle") or "")
     combined = f"{question} {desc} {slug} {group_title}".lower()
 
-    slug_match = "btc-updown-5m" in slug
-    is_btc = bool(_BTC_RE.search(combined))
-    is_5m = bool(_FIVEMIN_RE.search(combined)) or slug_match
-    is_updown = _has_updown(combined) or slug_match
+    looks_daily = (
+        bool(_DAILY_UPDOWN_RE.search(combined))
+        or "bitcoin-up-or-down-on-" in slug
+        or ("bitcoin" in combined and "up or down on" in combined)
+    )
 
-    if not is_btc or not is_5m or not is_updown:
+    is_btc = bool(_BTC_RE.search(combined))
+    is_updown = _has_updown(combined) or "up-or-down" in slug
+
+    if not is_btc or not looks_daily or not is_updown:
         return None
     if mkt.get("closed") or mkt.get("archived") or mkt.get("resolved"):
         return None
@@ -309,29 +314,30 @@ def _normalize_candidate(mkt: dict, source: str = "") -> Optional[dict]:
         "source":      source,
     }
 
-def _slug_candidates():
-    now = int(time.time())
-    current_floor = now - (now % 300)
-    vals = []
-    for delta in (-600, -300, 0, 300, 600, 900):
-        vals.append(f"btc-updown-5m-{current_floor + delta}")
-    return vals
+def _search_terms():
+    today_utc = datetime.now(timezone.utc)
+    terms = [
+        "bitcoin up or down on",
+        "bitcoin up or down march",
+        "bitcoin up or down tomorrow",
+        "bitcoin up or down today",
+        "bitcoin up down daily",
+    ]
+    # add exact nearby dates in long month format
+    for days in range(0, 4):
+        dt = today_utc.timestamp() + days * 86400
+        d = datetime.fromtimestamp(dt, tz=timezone.utc)
+        terms.append(f"bitcoin up or down on {d.strftime('%B')} {d.day}, {d.year}")
+    return terms
 
 def discover_market() -> Optional[dict]:
     log.info("Market discovery — trying public search first")
 
     now = time.time()
-    search_terms = [
-        "btc-updown-5m",
-        "bitcoin up or down 5 minutes",
-        "btc up or down 5 minutes",
-        "bitcoin 5m",
-    ]
-
     candidates = []
 
     # 1) public search
-    for term in search_terms:
+    for term in _search_terms():
         data = _get(PUBLIC_SEARCH_URL, params={"q": term})
         if data is None:
             continue
@@ -349,7 +355,7 @@ def discover_market() -> Optional[dict]:
             if not isinstance(item, dict):
                 continue
             mkt = item.get("market") if isinstance(item.get("market"), dict) else item
-            cand = _normalize_candidate(mkt, source=f"search:{term}")
+            cand = _normalize_daily_candidate(mkt, source=f"search:{term}")
             if cand:
                 candidates.append(cand)
                 log.info(
@@ -359,49 +365,15 @@ def discover_market() -> Optional[dict]:
                     f"q='{cand['question'][:80]}'"
                 )
 
-    valid_search = [c for c in candidates if c["expiry_ts"] - time.time() > 25]
+    valid_search = [c for c in candidates if c["expiry_ts"] - time.time() > 1800]
     if valid_search:
         best = min(valid_search, key=lambda c: c["expiry_ts"])
-        log.info(f"Selected market via public search: {best['market_id']} | {best['question'][:70]}")
+        log.info(f"Selected daily market via public search: {best['market_id']} | {best['question'][:70]}")
         return best
 
-    log.info("Public search found nothing — trying direct slug lookup")
+    log.info("Public search found nothing — falling back to Gamma markets scan")
 
-    # 2) direct slug lookup
-    direct_candidates = []
-    for slug in _slug_candidates():
-        data = _get(f"{GAMMA_MARKETS_URL}/slug/{slug}")
-        if data is None:
-            continue
-
-        markets = data if isinstance(data, list) else (
-            data.get("data") or data.get("markets") or data.get("results") or [data]
-        )
-
-        if isinstance(markets, dict):
-            markets = [markets]
-
-        for mkt in markets:
-            if not isinstance(mkt, dict):
-                continue
-            cand = _normalize_candidate(mkt, source=f"slug:{slug}")
-            if cand:
-                direct_candidates.append(cand)
-                log.info(
-                    f"DIRECT CANDIDATE id={cand['market_id']} "
-                    f"expiry_in={cand['expiry_ts'] - time.time():.0f}s "
-                    f"slug='{cand.get('slug', '')}'"
-                )
-
-    valid_direct = [c for c in direct_candidates if c["expiry_ts"] - time.time() > 25]
-    if valid_direct:
-        best = min(valid_direct, key=lambda c: c["expiry_ts"])
-        log.info(f"Selected market via slug: {best['market_id']} | {best['question'][:70]}")
-        return best
-
-    log.info("Direct slug lookup found nothing — falling back to Gamma markets scan")
-
-    # 3) bulk markets scan
+    # 2) bulk scan
     all_markets = []
     offset = 0
     limit = 200
@@ -448,16 +420,19 @@ def discover_market() -> Optional[dict]:
 
         if not bool(_BTC_RE.search(combined)):
             continue
-        if not (bool(_FIVEMIN_RE.search(combined)) or "btc-updown-5m" in slug):
+
+        looks_daily = (
+            bool(_DAILY_UPDOWN_RE.search(combined))
+            or "bitcoin-up-or-down-on-" in slug
+            or ("bitcoin" in combined and "up or down on" in combined)
+        )
+
+        if not looks_daily:
             if len(near_misses) < 10:
-                near_misses.append(f"SKIP no 5m: {label_for_log}")
-            continue
-        if not (_has_updown(combined) or "btc-updown-5m" in slug):
-            if len(near_misses) < 10:
-                near_misses.append(f"SKIP no up/down: {label_for_log}")
+                near_misses.append(f"SKIP not daily up/down: {label_for_log}")
             continue
 
-        cand = _normalize_candidate(mkt, source="scan")
+        cand = _normalize_daily_candidate(mkt, source="scan")
         if cand:
             scan_candidates.append(cand)
             log.info(
@@ -470,13 +445,13 @@ def discover_market() -> Optional[dict]:
     for line in near_misses[:10]:
         log.info(line)
 
-    valid_scan = [c for c in scan_candidates if c["expiry_ts"] - time.time() > 25]
+    valid_scan = [c for c in scan_candidates if c["expiry_ts"] - time.time() > 1800]
     if valid_scan:
         best = min(valid_scan, key=lambda c: c["expiry_ts"])
-        log.info(f"Selected market via scan: {best['market_id']} | {best['question'][:70]}")
+        log.info(f"Selected daily market via scan: {best['market_id']} | {best['question'][:70]}")
         return best
 
-    log.warning("No BTC 5m Up/Down market found via search, slug, or markets scan")
+    log.warning("No daily BTC Up/Down market found via search or scan")
     return None
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -665,7 +640,7 @@ def _enter_trade(signal: str, side: str, entry_ask: float,
     mom_str = f"{momentum * 100:+.4f}%" if momentum is not None else "N/A"
     log.info(f">>> TRADE #{tid} ENTERED | {signal.upper()} {side}{arb_str} | "
              f"shares={shares} fee=${entry_fee:.4f} | "
-             f"btc=${btc_price:.2f} mom={mom_str} | {time_left:.0f}s left")
+             f"btc=${btc_price:.2f} mom={mom_str} | {time_left/3600:.2f}h left")
     _log_trade_csv(trade, "ENTER")
     return trade
 
@@ -962,7 +937,7 @@ def build_metrics() -> dict:
 #  BOT LOOP
 # ──────────────────────────────────────────────────────────────────────────────
 
-_DISCOVERY_INTERVAL = 60
+_DISCOVERY_INTERVAL = 300   # every 5 minutes
 _last_discovery = 0.0
 
 def bot_tick():
@@ -989,11 +964,11 @@ def bot_tick():
         market_id = state["market_id"]
         exp = state["market_expiry"]
 
-    market_expired = exp is not None and exp - now < 10
+    market_expired = exp is not None and exp - now < 600
 
     if market_expired or market_id is None or (now - _last_discovery) > _DISCOVERY_INTERVAL:
         if market_expired:
-            log.info(f"Market {market_id} expired — resolving open trades")
+            log.info(f"Market {market_id} nearing expiry — resolving open trades")
             resolve_expired_trades()
         handle_market_rollover()
         _last_discovery = now
@@ -1023,7 +998,7 @@ def bot_tick():
 
         ste = seconds_to_expiry()
         if ste is not None and both_live and btc is not None and in_entry_window():
-            log.info(f"ENTRY WINDOW OPEN | market={mkt_id} ste={ste:.0f}s btc=${btc:.2f}")
+            log.info(f"ENTRY WINDOW OPEN | market={mkt_id} ste={ste/3600:.2f}h btc=${btc:.2f}")
             evaluate_and_enter()
 
     elif mkt_id is None:
@@ -1101,7 +1076,7 @@ def index():
     metrics = build_metrics()
     expiry_str = (datetime.fromtimestamp(expiry, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                   if expiry else "—")
-    ste_str = f"{ste:.0f}s" if ste is not None else "—"
+    ste_str = f"{ste/3600:.2f}h" if ste is not None else "—"
 
     status_color = {
         "LIVE":      "#00d17a",
@@ -1145,9 +1120,9 @@ def index():
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="refresh" content="10">
+<meta http-equiv="refresh" content="15">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Polymarket Paper Bot</title>
+<title>Polymarket Daily BTC Bot</title>
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
   body{{background:#0a0c0e;color:#e2e8ed;font-family:monospace;font-size:13px;line-height:1.5;padding:0}}
@@ -1182,10 +1157,10 @@ def index():
 <body>
 <div class="header">
   <span class="status-dot"></span>
-  <h1>Polymarket Paper Bot</h1>
+  <h1>Polymarket Daily BTC Bot</h1>
   <span class="pill pill-paper">PAPER ONLY</span>
   <span style="color:{status_color};font-size:11px;font-weight:600">{status_val}</span>
-  <span style="margin-left:auto;color:#4d5c68;font-size:10px">Auto-refresh 10s</span>
+  <span style="margin-left:auto;color:#4d5c68;font-size:10px">Auto-refresh 15s</span>
 </div>
 
 <div class="grid">
@@ -1260,7 +1235,7 @@ def start_bot():
 
 if __name__ == "__main__":
     log.info("=" * 60)
-    log.info("  POLYMARKET BTC 5M PAPER TRADING BOT")
+    log.info("  POLYMARKET DAILY BTC UP/DOWN PAPER BOT")
     log.info("  PAPER ONLY — NO REAL ORDERS")
     log.info("=" * 60)
     log.info("Config:")
